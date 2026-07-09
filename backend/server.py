@@ -21,9 +21,10 @@ from seed_data import SEED_SERVICES
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+mongo_url = os.environ.get('MONGO_URL', '')
+db_name = os.environ.get('DB_NAME', 'uuon_gateway')
+client = AsyncIOMotorClient(mongo_url) if mongo_url else None
+db = client[db_name] if client else None
 
 ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN')
 RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
@@ -129,19 +130,25 @@ class TestRunRequest(BaseModel):
 
 @app.on_event("startup")
 async def seed_services():
-    from seed_data import ARCADE_SERVICES, ARCHIVED_MAIN_SLUGS
-    if ARCHIVED_MAIN_SLUGS:
-        await db.services.delete_many({"slug": {"$in": ARCHIVED_MAIN_SLUGS}})
-    for s in SEED_SERVICES:
-        await db.services.update_one(
-            {"slug": s["slug"]},
-            {"$set": {**s}},
-            upsert=True,
-        )
-    await db.arcade.delete_many({})
-    if ARCADE_SERVICES:
-        await db.arcade.insert_many([{**a} for a in ARCADE_SERVICES])
-    logging.info("Seeded %d services, arcade=%d", len(SEED_SERVICES), len(ARCADE_SERVICES))
+    if db is None:
+        logging.warning("No MONGO_URL set — skipping seed")
+        return
+    try:
+        from seed_data import ARCADE_SERVICES, ARCHIVED_MAIN_SLUGS
+        if ARCHIVED_MAIN_SLUGS:
+            await db.services.delete_many({"slug": {"$in": ARCHIVED_MAIN_SLUGS}})
+        for s in SEED_SERVICES:
+            await db.services.update_one(
+                {"slug": s["slug"]},
+                {"$set": {**s}},
+                upsert=True,
+            )
+        await db.arcade.delete_many({})
+        if ARCADE_SERVICES:
+            await db.arcade.insert_many([{**a} for a in ARCADE_SERVICES])
+        logging.info("Seeded %d services, arcade=%d", len(SEED_SERVICES), len(ARCADE_SERVICES))
+    except Exception as e:
+        logging.error("Seed failed: %s", e)
 
 
 def strip_id(doc: dict) -> dict:
@@ -175,10 +182,11 @@ async def root():
 
 @api_router.get("/health")
 async def health():
+    db_status = "connected" if db is not None else "no_mongo_url"
     return {
         "status": "online",
+        "db": db_status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "uptime": "99.98%",
     }
 
 
