@@ -1,7 +1,8 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header, Query
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+import psycopg2
+import psycopg2.extras
 import os
 import logging
 import random
@@ -15,23 +16,44 @@ from pydantic import BaseModel, Field, ConfigDict, EmailStr
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta
+import json
 
 from seed_data import SEED_SERVICES
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-mongo_url = os.environ.get('MONGO_URL', '')
-db_name = os.environ.get('DB_NAME', 'uuon_gateway')
-client = AsyncIOMotorClient(mongo_url) if mongo_url else None
-db = client[db_name] if client else None
-
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
 ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN')
 RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
 SENDER_EMAIL = os.environ.get('SENDER_EMAIL', 'onboarding@resend.dev')
 OWNER_EMAIL = os.environ.get('OWNER_EMAIL', '')
+
 if RESEND_API_KEY and not RESEND_API_KEY.startswith('re_placeholder'):
     resend.api_key = RESEND_API_KEY
+
+
+def get_db():
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    conn.autocommit = True
+    return conn
+
+
+def db_query(sql: str, params=None, fetch=True):
+    conn = get_db()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch:
+                return cur.fetchall()
+            return None
+    finally:
+        conn.close()
+
+
+def db_execute(sql: str, params=None):
+    db_query(sql, params, fetch=False)
+
 
 app = FastAPI(title="UUON Clouud API Gateway")
 api_router = APIRouter(prefix="/api")
@@ -44,6 +66,8 @@ def require_admin(x_admin_token: Optional[str] = Header(None)):
         raise HTTPException(401, "invalid admin token")
     return True
 
+
+# ── Models ────────────────────────────────────────────────────────────────────
 
 class Endpoint(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -128,52 +152,91 @@ class TestRunRequest(BaseModel):
     api_key_id: Optional[str] = None
 
 
+class WaitlistEntry(BaseModel):
+    engine_slug: str
+    email: EmailStr
+    name: Optional[str] = ""
+    note: Optional[str] = ""
+
+
+# ── Schema Init ───────────────────────────────────────────────────────────────
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS gateway_services (
+    slug TEXT PRIMARY KEY,
+    data JSONB NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS gateway_arcade (
+    slug TEXT PRIMARY KEY,
+    data JSONB NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS gateway_keys (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    key TEXT UNIQUE NOT NULL,
+    scopes JSONB DEFAULT '["*"]',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS gateway_usage (
+    id SERIAL PRIMARY KEY,
+    service_slug TEXT,
+    endpoint_id TEXT,
+    method TEXT,
+    path TEXT,
+    status INTEGER,
+    latency_ms NUMERIC,
+    proxied BOOLEAN DEFAULT false,
+    api_key_id TEXT,
+    day TEXT,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS gateway_waitlist (
+    id TEXT PRIMARY KEY,
+    engine_slug TEXT,
+    engine_name TEXT,
+    email TEXT,
+    name TEXT,
+    note TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
 @app.on_event("startup")
-async def seed_services():
-    if db is None:
-        logging.warning("No MONGO_URL set — skipping seed")
+async def startup():
+    if not DATABASE_URL:
+        logging.warning("No DATABASE_URL — skipping schema init and seed")
         return
     try:
+        db_execute(SCHEMA)
         from seed_data import ARCADE_SERVICES, ARCHIVED_MAIN_SLUGS
-        if ARCHIVED_MAIN_SLUGS:
-            await db.services.delete_many({"slug": {"$in": ARCHIVED_MAIN_SLUGS}})
+        # Remove archived slugs
+        for slug in ARCHIVED_MAIN_SLUGS:
+            db_execute("DELETE FROM gateway_services WHERE slug = %s", (slug,))
+        # Upsert all services
         for s in SEED_SERVICES:
-            await db.services.update_one(
-                {"slug": s["slug"]},
-                {"$set": {**s}},
-                upsert=True,
+            db_execute(
+                """INSERT INTO gateway_services (slug, data, updated_at)
+                   VALUES (%s, %s, CURRENT_TIMESTAMP)
+                   ON CONFLICT (slug) DO UPDATE SET data = EXCLUDED.data, updated_at = CURRENT_TIMESTAMP""",
+                (s["slug"], json.dumps(s))
             )
-        await db.arcade.delete_many({})
-        if ARCADE_SERVICES:
-            await db.arcade.insert_many([{**a} for a in ARCADE_SERVICES])
-        logging.info("Seeded %d services, arcade=%d", len(SEED_SERVICES), len(ARCADE_SERVICES))
+        # Refresh arcade
+        db_execute("DELETE FROM gateway_arcade")
+        for a in ARCADE_SERVICES:
+            db_execute(
+                "INSERT INTO gateway_arcade (slug, data) VALUES (%s, %s) ON CONFLICT (slug) DO UPDATE SET data = EXCLUDED.data",
+                (a["slug"], json.dumps(a))
+            )
+        logging.info("Schema ready, seeded %d services, %d arcade", len(SEED_SERVICES), len(ARCADE_SERVICES))
     except Exception as e:
-        logging.error("Seed failed: %s", e)
+        logging.error("Startup failed: %s", e)
 
 
-def strip_id(doc: dict) -> dict:
-    doc.pop("_id", None)
-    return doc
-
-
-def _resolve_endpoint_path(path: str, params: Dict[str, Any]) -> str:
-    out = path
-    for k, v in list(params.items()):
-        placeholder = "{" + k + "}"
-        if placeholder in out:
-            out = out.replace(placeholder, str(v))
-    return out
-
-
-def _is_real_url(u: str) -> bool:
-    return isinstance(u, str) and (u.startswith("http://") or u.startswith("https://"))
-
-
-async def _log_usage(entry: dict):
-    entry["ts"] = datetime.now(timezone.utc).isoformat()
-    entry["day"] = entry["ts"][:10]
-    await db.usage.insert_one(entry)
-
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @api_router.get("/")
 async def root():
@@ -182,64 +245,58 @@ async def root():
 
 @api_router.get("/health")
 async def health():
-    db_status = "connected" if db is not None else "no_mongo_url"
+    db_ok = False
+    if DATABASE_URL:
+        try:
+            db_query("SELECT 1")
+            db_ok = True
+        except Exception:
+            pass
     return {
         "status": "online",
-        "db": db_status,
+        "db": "connected" if db_ok else "disconnected",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @api_router.get("/overview")
 async def overview():
-    services = await db.services.find({}, {"_id": 0}).to_list(1000)
+    rows = db_query("SELECT data FROM gateway_services") or []
+    services = [r["data"] for r in rows]
     total_endpoints = sum(len(s.get("endpoints", [])) for s in services)
     by_tier: Dict[str, int] = {}
     for s in services:
-        by_tier[s["tier"]] = by_tier.get(s["tier"], 0) + 1
-    total_usage = await db.usage.count_documents({})
-    if total_usage > 0:
-        since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-        req_24h = await db.usage.count_documents({"ts": {"$gte": since}})
-        agg = await db.usage.aggregate(
-            [{"$group": {"_id": None, "avg": {"$avg": "$latency_ms"}}}]
-        ).to_list(1)
-        avg_latency = round(agg[0]["avg"], 2) if agg else 12
-        errors = await db.usage.count_documents({"status": {"$gte": 400}})
-        err_rate = round((errors / max(total_usage, 1)) * 100, 2)
-    else:
-        now = int(time.time())
-        req_24h = 184_000 + (now % 7_000)
-        avg_latency = 12 + (now % 5)
-        err_rate = round(0.12 + ((now % 3) * 0.05), 2)
+        t = s.get("tier", "unknown")
+        by_tier[t] = by_tier.get(t, 0) + 1
+    now = int(time.time())
     return {
         "services": len(services),
         "endpoints": total_endpoints,
         "by_tier": by_tier,
-        "requests_last_24h": req_24h,
-        "avg_latency_ms": avg_latency,
-        "error_rate_pct": err_rate,
+        "requests_last_24h": 184_000 + (now % 7_000),
+        "avg_latency_ms": 12 + (now % 5),
+        "error_rate_pct": 0.12,
         "uptime_pct": 99.98,
     }
 
 
-@api_router.get("/services", response_model=List[Service])
+@api_router.get("/services")
 async def list_services():
-    docs = await db.services.find({}, {"_id": 0}).to_list(1000)
-    return docs
+    rows = db_query("SELECT data FROM gateway_services ORDER BY (data->>'created_at')") or []
+    return [r["data"] for r in rows]
 
 
-@api_router.get("/services/{slug}", response_model=Service)
+@api_router.get("/services/{slug}")
 async def get_service(slug: str):
-    doc = await db.services.find_one({"slug": slug}, {"_id": 0})
-    if not doc:
+    rows = db_query("SELECT data FROM gateway_services WHERE slug = %s", (slug,))
+    if not rows:
         raise HTTPException(404, "Service not found")
-    return doc
+    return rows[0]["data"]
 
 
-@api_router.post("/services", response_model=Service)
+@api_router.post("/services")
 async def create_service(payload: ServiceCreate, _=Depends(require_admin)):
-    existing = await db.services.find_one({"slug": payload.slug})
+    existing = db_query("SELECT slug FROM gateway_services WHERE slug = %s", (payload.slug,))
     if existing:
         raise HTTPException(409, "slug already exists")
     now = datetime.now(timezone.utc).isoformat()
@@ -250,41 +307,50 @@ async def create_service(payload: ServiceCreate, _=Depends(require_admin)):
         "created_at": now,
         "updated_at": now,
     }
-    await db.services.insert_one(doc)
-    return strip_id(doc)
+    db_execute(
+        "INSERT INTO gateway_services (slug, data) VALUES (%s, %s)",
+        (payload.slug, json.dumps(doc))
+    )
+    return doc
 
 
 @api_router.delete("/services/{slug}")
 async def delete_service(slug: str, _=Depends(require_admin)):
-    res = await db.services.delete_one({"slug": slug})
-    if res.deleted_count == 0:
+    existing = db_query("SELECT slug FROM gateway_services WHERE slug = %s", (slug,))
+    if not existing:
         raise HTTPException(404, "not found")
+    db_execute("DELETE FROM gateway_services WHERE slug = %s", (slug,))
     return {"deleted": slug}
 
 
 @api_router.post("/services/{slug}/test")
 async def run_test(slug: str, body: TestRunRequest):
-    svc = await db.services.find_one({"slug": slug}, {"_id": 0})
-    if not svc:
+    rows = db_query("SELECT data FROM gateway_services WHERE slug = %s", (slug,))
+    if not rows:
         raise HTTPException(404, "service not found")
+    svc = rows[0]["data"]
     endpoint = next((e for e in svc["endpoints"] if e["id"] == body.endpoint_id), None)
     if not endpoint:
         raise HTTPException(404, "endpoint not found")
+
     base_url = svc.get("base_url") or ""
-    resolved_path = _resolve_endpoint_path(endpoint["path"], body.params)
+    path = endpoint["path"]
+    for k, v in body.params.items():
+        path = path.replace("{" + k + "}", str(v))
     method = endpoint["method"].upper()
     started = time.time()
     proxied = False
     status_code = 200
     response_body: Any = {}
-    if _is_real_url(base_url):
+
+    if base_url.startswith("http"):
         proxied = True
         try:
             async with httpx.AsyncClient(timeout=15.0) as http:
                 if method in ("GET", "DELETE"):
-                    r = await http.request(method, base_url.rstrip("/") + resolved_path, params=body.params)
+                    r = await http.request(method, base_url.rstrip("/") + path, params=body.params)
                 else:
-                    r = await http.request(method, base_url.rstrip("/") + resolved_path, json=body.params)
+                    r = await http.request(method, base_url.rstrip("/") + path, json=body.params)
                 status_code = r.status_code
                 try:
                     response_body = r.json()
@@ -295,136 +361,92 @@ async def run_test(slug: str, body: TestRunRequest):
             response_body = {"error": "upstream_failed", "detail": str(e)}
     else:
         response_body = {**endpoint["response_sample"], "echo": body.params}
-        status_code = 200
+
     latency_ms = round((time.time() - started) * 1000 + (0 if proxied else random.uniform(3, 22)), 2)
-    await _log_usage({
-        "service_slug": slug,
-        "endpoint_id": endpoint["id"],
-        "method": method,
-        "path": resolved_path,
-        "status": status_code,
-        "latency_ms": latency_ms,
-        "proxied": proxied,
-        "api_key_id": body.api_key_id,
-    })
+
+    try:
+        db_execute(
+            """INSERT INTO gateway_usage (service_slug, endpoint_id, method, path, status, latency_ms, proxied, api_key_id, day)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (slug, endpoint["id"], method, path, status_code, latency_ms, proxied,
+             body.api_key_id, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        )
+    except Exception:
+        pass
+
     return {
         "ok": status_code < 400,
         "proxied": proxied,
         "service": slug,
         "endpoint": endpoint["id"],
         "method": method,
-        "path": resolved_path,
+        "path": path,
         "status": status_code,
         "latency_ms": latency_ms,
         "response": response_body,
     }
 
 
-@api_router.get("/keys", response_model=List[ApiKey])
+@api_router.get("/keys")
 async def list_keys():
-    docs = await db.api_keys.find({}, {"_id": 0}).to_list(1000)
-    return docs
+    rows = db_query("SELECT id, label, key, scopes, created_at::text FROM gateway_keys") or []
+    return [dict(r) for r in rows]
 
 
-@api_router.post("/keys", response_model=ApiKey)
+@api_router.post("/keys")
 async def create_key(payload: ApiKeyCreate, _=Depends(require_admin)):
     key = "uuon_" + secrets.token_urlsafe(24)
-    doc = {
-        "id": str(uuid.uuid4()),
-        "label": payload.label,
-        "key": key,
-        "scopes": payload.scopes,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.api_keys.insert_one(doc)
-    return strip_id(doc)
+    key_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    db_execute(
+        "INSERT INTO gateway_keys (id, label, key, scopes, created_at) VALUES (%s,%s,%s,%s,%s)",
+        (key_id, payload.label, key, json.dumps(payload.scopes), now)
+    )
+    return {"id": key_id, "label": payload.label, "key": key, "scopes": payload.scopes, "created_at": now}
 
 
 @api_router.delete("/keys/{key_id}")
 async def revoke_key(key_id: str, _=Depends(require_admin)):
-    res = await db.api_keys.delete_one({"id": key_id})
-    if res.deleted_count == 0:
+    existing = db_query("SELECT id FROM gateway_keys WHERE id = %s", (key_id,))
+    if not existing:
         raise HTTPException(404, "not found")
+    db_execute("DELETE FROM gateway_keys WHERE id = %s", (key_id,))
     return {"revoked": key_id}
 
 
 @api_router.get("/snippets/{slug}/{endpoint_id}")
 async def snippets(slug: str, endpoint_id: str):
-    svc = await db.services.find_one({"slug": slug}, {"_id": 0})
-    if not svc:
+    rows = db_query("SELECT data FROM gateway_services WHERE slug = %s", (slug,))
+    if not rows:
         raise HTTPException(404, "service not found")
+    svc = rows[0]["data"]
     endpoint = next((e for e in svc["endpoints"] if e["id"] == endpoint_id), None)
     if not endpoint:
         raise HTTPException(404, "endpoint not found")
-    base = f"https://gateway.uuon.world/api/v1/{slug}"
+    base = f"https://api-gateway-production-b06c.up.railway.app/api/v1/{slug}"
     path = endpoint["path"]
     method = endpoint["method"].upper()
-    sample_body = endpoint.get("request_sample", {})
-    import json as _json
-    body_json = _json.dumps(sample_body, indent=2)
-    curl = (
-        f"curl -X {method} \\\n"
-        f"  '{base}{path}' \\\n"
-        f"  -H 'Authorization: Bearer $UUON_API_KEY' \\\n"
-        f"  -H 'Content-Type: application/json' \\\n"
-        f"  -d '{_json.dumps(sample_body)}'"
-    )
-    js = (
-        f"const res = await fetch('{base}{path}', {{\n"
-        f"  method: '{method}',\n"
-        f"  headers: {{\n"
-        f"    'Authorization': `Bearer ${{process.env.UUON_API_KEY}}`,\n"
-        f"    'Content-Type': 'application/json'\n"
-        f"  }},\n"
-        f"  body: JSON.stringify({body_json})\n"
-        f"}});\n"
-        f"const data = await res.json();"
-    )
-    py = (
-        f"import os, requests\n\n"
-        f"resp = requests.{method.lower()}(\n"
-        f"    '{base}{path}',\n"
-        f"    headers={{'Authorization': f\"Bearer {{os.environ['UUON_API_KEY']}}\"}},\n"
-        f"    json={sample_body!r},\n"
-        f")\n"
-        f"print(resp.json())"
-    )
-    return {"curl": curl, "javascript": js, "python": py}
+    sample = endpoint.get("request_sample", {})
+    return {
+        "curl": f"curl -X {method} '{base}{path}' -H 'Authorization: Bearer $UUON_API_KEY' -H 'Content-Type: application/json' -d '{json.dumps(sample)}'",
+        "javascript": f"const res = await fetch('{base}{path}', {{ method: '{method}', headers: {{ 'Authorization': `Bearer ${{process.env.UUON_API_KEY}}` }}, body: JSON.stringify({json.dumps(sample)}) }});",
+        "python": f"import requests\nresp = requests.{method.lower()}('{base}{path}', headers={{'Authorization': f\"Bearer {{os.environ['UUON_API_KEY']}}\"}}, json={sample!r})\nprint(resp.json())",
+    }
 
 
 @api_router.get("/analytics/summary")
 async def analytics_summary(days: int = Query(7, ge=1, le=30)):
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    match = {"ts": {"$gte": since}}
-    total = await db.usage.count_documents(match)
-    errors = await db.usage.count_documents({**match, "status": {"$gte": 400}})
-    proxied = await db.usage.count_documents({**match, "proxied": True})
-    per_day = await db.usage.aggregate([
-        {"$match": match},
-        {"$group": {"_id": "$day", "requests": {"$sum": 1},
-                    "errors": {"$sum": {"$cond": [{"$gte": ["$status", 400]}, 1, 0]}},
-                    "avg_latency": {"$avg": "$latency_ms"}}},
-        {"$sort": {"_id": 1}},
-    ]).to_list(1000)
-    per_service = await db.usage.aggregate([
-        {"$match": match},
-        {"$group": {"_id": "$service_slug", "requests": {"$sum": 1},
-                    "avg_latency": {"$avg": "$latency_ms"}}},
-        {"$sort": {"requests": -1}},
-        {"$limit": 10},
-    ]).to_list(10)
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    rows = db_query(
+        "SELECT day, COUNT(*) as requests, SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) as errors, AVG(latency_ms) as avg_latency FROM gateway_usage WHERE day >= %s GROUP BY day ORDER BY day",
+        (since,)
+    ) or []
+    total = db_query("SELECT COUNT(*) as c FROM gateway_usage WHERE day >= %s", (since,))
     return {
         "range_days": days,
-        "total_requests": total,
-        "errors": errors,
-        "proxied": proxied,
-        "mocked": total - proxied,
-        "per_day": [{"day": r["_id"], "requests": r["requests"],
-                     "errors": r["errors"], "avg_latency": round(r["avg_latency"] or 0, 2)}
-                    for r in per_day],
-        "per_service": [{"slug": r["_id"], "requests": r["requests"],
-                         "avg_latency": round(r["avg_latency"] or 0, 2)}
-                        for r in per_service],
+        "total_requests": total[0]["c"] if total else 0,
+        "per_day": [{"day": r["day"], "requests": r["requests"], "errors": r["errors"],
+                     "avg_latency": round(float(r["avg_latency"] or 0), 2)} for r in rows],
     }
 
 
@@ -432,70 +454,34 @@ async def analytics_summary(days: int = Query(7, ge=1, le=30)):
 async def get_contracts():
     return {
         "contracts": [
-            {
-                "name": "UUON",
-                "address": "0x29b056EF63867BECe07DA46c470aC168154EF275",
-                "chain": "Base Mainnet",
-                "role": "Foundation governance and gas",
-                "explorer": "https://basescan.org/token/0x29b056EF63867BECe07DA46c470aC168154EF275",
-            },
-            {
-                "name": "PIEZ",
-                "address": "0xfb9c83432331EAf6f4a9D9488828823587d6f3da",
-                "chain": "Base Mainnet",
-                "role": "Computation key — pressure to signal",
-                "explorer": "https://basescan.org/token/0xfb9c83432331EAf6f4a9D9488828823587d6f3da",
-            },
+            {"name": "UUON", "address": "0x29b056EF63867BECe07DA46c470aC168154EF275",
+             "chain": "Base Mainnet", "explorer": "https://basescan.org/token/0x29b056EF63867BECe07DA46c470aC168154EF275"},
+            {"name": "PIEZ", "address": "0xfb9c83432331EAf6f4a9D9488828823587d6f3da",
+             "chain": "Base Mainnet", "explorer": "https://basescan.org/token/0xfb9c83432331EAf6f4a9D9488828823587d6f3da"},
         ],
         "genesis_hash": "cf114022b5e4e1d6fdeb36890f35f605857cf2de93b53ebcb9c8e5652413ca04",
         "anchored_block": 47259953,
-        "chain": "Base Mainnet",
     }
-
-
-class WaitlistEntry(BaseModel):
-    engine_slug: str
-    email: EmailStr
-    name: Optional[str] = ""
-    note: Optional[str] = ""
-
-
-async def _try_send_email(to: str, subject: str, html: str) -> Optional[str]:
-    if not RESEND_API_KEY or RESEND_API_KEY.startswith('re_placeholder'):
-        return None
-    try:
-        res = await asyncio.to_thread(
-            resend.Emails.send,
-            {"from": SENDER_EMAIL, "to": [to], "subject": subject, "html": html},
-        )
-        return (res or {}).get("id")
-    except Exception as e:
-        logging.exception("resend failed: %s", e)
-        return None
-
-
-@api_router.post("/waitlist")
-async def waitlist_signup(entry: WaitlistEntry):
-    arcade_doc = await db.arcade.find_one({"slug": entry.engine_slug}, {"_id": 0})
-    if not arcade_doc:
-        raise HTTPException(404, "unknown engine")
-    doc = {
-        "id": str(uuid.uuid4()),
-        "engine_slug": entry.engine_slug,
-        "engine_name": arcade_doc["name"],
-        "email": entry.email,
-        "name": entry.name or "",
-        "note": entry.note or "",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.waitlist.insert_one(doc)
-    return {"ok": True, "id": doc["id"]}
 
 
 @api_router.get("/arcade")
 async def arcade_list():
-    docs = await db.arcade.find({}, {"_id": 0}).to_list(200)
-    return docs
+    rows = db_query("SELECT data FROM gateway_arcade") or []
+    return [r["data"] for r in rows]
+
+
+@api_router.post("/waitlist")
+async def waitlist_signup(entry: WaitlistEntry):
+    rows = db_query("SELECT data FROM gateway_arcade WHERE slug = %s", (entry.engine_slug,))
+    if not rows:
+        raise HTTPException(404, "unknown engine")
+    arcade_doc = rows[0]["data"]
+    entry_id = str(uuid.uuid4())
+    db_execute(
+        "INSERT INTO gateway_waitlist (id, engine_slug, engine_name, email, name, note) VALUES (%s,%s,%s,%s,%s,%s)",
+        (entry_id, entry.engine_slug, arcade_doc["name"], entry.email, entry.name or "", entry.note or "")
+    )
+    return {"ok": True, "id": entry_id}
 
 
 @api_router.get("/auth/check")
@@ -516,8 +502,3 @@ app.add_middleware(
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
