@@ -1,0 +1,51 @@
+services:
+
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: uuon_gateway
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: uuon_gateway
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      RESEND_API_KEY: ${RESEND_API_KEY:-re_placeholder}
+      SENDER_EMAIL: ${SENDER_EMAIL:-onboarding@resend.dev}
+      OWNER_EMAIL: ${OWNER_EMAIL:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+    ports:
+      - "8001:8001"
+    volumes:
+      - uploads_data:/app/uploads
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        REACT_APP_BACKEND_URL: ${REACT_APP_BACKEND_URL:-http://localhost:8001}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+
+volumes:
+  mongo_data:
+  uploads_data:
